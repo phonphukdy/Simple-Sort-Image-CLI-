@@ -9,6 +9,7 @@ Commands while running (type and press Enter):
   d              delete this photo (moved to system Trash on exit)
   o              move to the "other" category (99_other)
   n              create a new category and move this photo into it
+  f              find category by name and move this photo
   <number>       move this photo into that category, e.g. 01
   u              undo the last action (repeatable)
   s              toggle preview mode (sixels / symbols)
@@ -48,7 +49,7 @@ OTHER_NAME = "other"
 MIN_CATEGORY_NUMBER = 1
 TRASH_STAGING_DIRNAME = ".sortimg_trash"
 ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*m")
-MAX_PREVIEW_HEIGHT = 22  # จำกัดความสูงรูปไม่ให้ใหญ่เกินไป
+MAX_PREVIEW_HEIGHT = 22
 
 
 # --------------------------------------------------------------------------
@@ -186,7 +187,6 @@ def render_ascii_fallback_lines(path: Path, width: int):
 
 def get_image_lines(path: Path, width: int, mode: str = "sixels"):
     tool = preview_tool()
-    # จำกัดขนาดทั้งความกว้างและความสูงไม่ให้เกินขอบเขต
     max_w = min(width, 55)
     max_h = MAX_PREVIEW_HEIGHT
 
@@ -246,6 +246,75 @@ def move_with_dup_check(src: Path, dest_dir: Path, base: Path):
     else:
         shutil.move(str(src), str(dest_path))
         return ("moved", dest_path)
+
+
+# --------------------------------------------------------------------------
+# Search Category Feature
+# --------------------------------------------------------------------------
+
+def search_and_move_category(path: Path, idx: int, history: list, base: Path, state: dict):
+    cats = scan_categories(base)
+    try:
+        query = input("Search category (Enter to cancel): ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print("\n[!] Cancelled search")
+        return "stay"
+
+    if not query:
+        print("[!] Cancelled search")
+        return "stay"
+
+    matches = {num: name for num, name in cats.items() if query in name.lower()}
+
+    if not matches:
+        print(f"[!] No categories matching '{query}' found")
+        return "stay"
+
+    target_num = None
+    if len(matches) == 1:
+        num, name = next(iter(matches.items()))
+        try:
+            confirm = input(f"Move to '{num:02d}_{name}'? [Y/n]: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print("\n[!] Cancelled")
+            return "stay"
+        if confirm in ("", "y", "yes"):
+            target_num = num
+        else:
+            print("[!] Cancelled")
+            return "stay"
+    else:
+        print("\nMultiple categories matched:")
+        for num in sorted(matches):
+            print(f"  {num:02d} - {matches[num]}")
+        try:
+            choice = input("Enter category number to move (Enter to cancel): ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\n[!] Cancelled")
+            return "stay"
+        if choice.isdigit() and int(choice) in matches:
+            target_num = int(choice)
+        else:
+            print("[!] Cancelled or invalid selection")
+            return "stay"
+
+    if target_num is not None:
+        dest_dir = base / f"{target_num:02d}_{cats[target_num]}"
+        kind, dest = move_with_dup_check(path, dest_dir, base)
+        history.append(
+            {
+                "action": kind,
+                "image_index": idx,
+                "original_path": path,
+                "dest_path": dest,
+                "created_category": False,
+            }
+        )
+        state["category_usage"][target_num] += 1
+        # คืนค่าหมายเลขหมวดหมู่กลับไปเพื่อให้ลูปหลักจำค่าการย้าย
+        return f"advance:{target_num:02d}"
+
+    return "stay"
 
 
 # --------------------------------------------------------------------------
@@ -314,6 +383,9 @@ def handle_command(cmd_line, path, idx, history, base, state):
         if prev_idx is None:
             return "stay"
         return f"goto:{prev_idx}"
+
+    if cmd == "f":
+        return search_and_move_category(path, idx, history, base, state)
 
     if cmd == "d":
         dest = soft_delete(path, base)
@@ -455,23 +527,34 @@ def clear_screen():
 def build_category_grid(cats: dict, state: dict, total_width: int):
     if not cats:
         return ["Categories: (none yet)"]
-    
-    if not state["show_all_cats"] and state["category_usage"]:
-        top_nums = [num for num, _ in state["category_usage"].most_common() if isinstance(num, int) and num in cats][:5]
-        display_cats = {num: cats[num] for num in top_nums}
-        title = f"Categories (Top-5 used, press 'c' to show all {len(cats)}):"
-    else:
-        display_cats = cats
-        title = f"Categories (All {len(cats)}, press 'c' to filter Top-5):" if len(cats) > 5 else "Categories:"
 
-    if not display_cats:
+    if state["show_all_cats"]:
         display_cats = cats
-        title = "Categories:"
+        title = f"Categories (All {len(cats)}):"
+    else:
+        usage = state["category_usage"]
+        top_nums = [
+            num for num, _ in usage.most_common()
+            if isinstance(num, int) and num in cats
+        ][:5]
+
+        if len(top_nums) < 5:
+            for num in sorted(cats):
+                if num not in top_nums:
+                    top_nums.append(num)
+                if len(top_nums) == 5:
+                    break
+
+        display_cats = {num: cats[num] for num in top_nums if num in cats}
+        if len(cats) > 5:
+            title = f"Categories (Top-5 used, press 'c' to show all {len(cats)}):"
+        else:
+            title = "Categories:"
 
     items = [f"{num:02d}-{display_cats[num]}" for num in sorted(display_cats)]
     lines = [title]
     current_line = "  "
-    
+
     for item in items:
         if len(current_line) + len(item) + 3 > total_width:
             lines.append(current_line)
@@ -480,7 +563,7 @@ def build_category_grid(cats: dict, state: dict, total_width: int):
             current_line += (", " if current_line.strip() else "") + item
     if current_line.strip():
         lines.append(current_line)
-        
+
     return lines
 
 
@@ -505,6 +588,7 @@ def get_command_lines(show_help: bool):
         "  d       delete (Trash)",
         "  o       move to 99_other",
         "  n       create new category",
+        "  f       find category",
         "  <num>   move to category",
         "  u       undo last action",
         "  s       toggle sixel/symbols",
@@ -528,17 +612,15 @@ def draw_screen(path: Path, idx: int, total: int, base: Path, state: dict):
     cmd_lines = get_command_lines(state["show_help"])
     image_lines = get_image_lines(path, 50, state["preview_mode"])
 
-    # โหมด Sixels: พิมพ์รูป แล้วพิมพ์ Commands บรรทัดถัดไปแบบแนวนอน/ระเบียบเรียบร้อยป้องกันการเบี้ยว
     if state["preview_mode"] == "sixels":
         for line in image_lines:
             print(line)
         print()
         if state["show_help"]:
-            print("Commands:  d:delete  o:other  n:new  u:undo  s:mode  v:view  c:cats  h:hide  q:quit")
+            print("Commands:  d:delete  o:other  n:new  f:find  u:undo  s:mode  v:view  c:cats  h:hide  q:quit")
         else:
             print("[Press 'h' to show commands]")
     else:
-        # โหมด Symbols: รวมคอลัมน์ Side-by-Side
         left_width = 50
         for line in compose_columns(image_lines, cmd_lines, left_width):
             print(line)
@@ -619,9 +701,12 @@ def main():
         result = handle_command(cmd_line, path, current_index, history, base, state)
         first_token = cmd_line.split()[0] if cmd_line.split() else ""
 
-        if result == "advance":
+        if result and result.startswith("advance"):
             current_index += 1
-            if first_token in ("d", "o", "n") or first_token.isdigit():
+            # ถ้ามีการย้ายหมวดหมู่จากการค้นหา (advance:01) ให้บันทึกเลขหมวดหมู่นั้นไว้
+            if ":" in result:
+                last_command = result.split(":")[1]
+            elif first_token in ("d", "o", "n") or first_token.isdigit():
                 last_command = cmd_line
         elif result and result.startswith("goto:"):
             current_index = int(result.split(":")[1])
